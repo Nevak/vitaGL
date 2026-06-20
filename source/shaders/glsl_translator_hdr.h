@@ -17,6 +17,7 @@ inline float4 vglMul(float4x4 M, float4 v) { return mul(v, M); }
 inline float3 vglMul(float3x3 M, float3 v) { return mul(v, M); }
 inline float2 vglMul(float2x2 M, float2 v) { return mul(v, M); }
 inline float4 vglMul(float4 v, float4x4 M) { return mul(M, v); }
+inline float3 vglMul(float4 v, float3x4 M) { return mul(M, v); }
 inline float3 vglMul(float3 v, float3x3 M) { return mul(M, v); }
 inline float2 vglMul(float2 v, float2x2 M) { return mul(M, v); }
 inline float4 vglMul(float v1, float4 v2) { return v1 * v2; }
@@ -95,6 +96,12 @@ inline float4 texture2DLod(sampler2D x, float2 coord, float lod) { return tex2Dl
 #define ss xx
 #define tt yy
 #define texture2D glslTexture2D
+inline float4 glslTexture(sampler2D x, float2 coord) { return tex2D(x,coord); }
+inline float4 glslTexture(sampler2D x, float3 coord) { return tex2D(x,coord); }
+inline float4 glslTexture(sampler2D x, float2 coord, float bias) { return tex2Dbias(x,float4(coord,1,bias)); }
+inline float4 glslTexture(samplerCUBE x, float3 coord) { return texCUBE(x,coord); }
+inline float4 glslTexture(samplerCUBE x, float3 coord, float bias) { return texCUBEbias(x,float4(coord,bias)); }
+#define texture glslTexture
 #define lowp
 #define mediump
 #define highp
@@ -122,6 +129,7 @@ inline float4 vgl_atan(float4 x) { return atan(x); }
 #define mat2 float2x2
 #define mat3 float3x3
 #define mat4 float4x4
+#define mat3x4 float3x4
 #define matrix _matrix
 #define Matrix _Matrix
 #define sampler _sampler

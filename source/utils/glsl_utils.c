@@ -909,7 +909,7 @@ LOOP_START:
 	while (left != txt) {
 		switch (*left) {
 		case 'n':
-			if (!strncmp(left - 5, "return", 6)) {
+			if (!strncmp(left - 5, "return", 6) && !((left[1] >= 'a' && left[1] <= 'z') || (left[1] >= 'A' && left[1] <= 'Z') || (left[1] >= '0' && left[1] <= '9') || left[1] == '_') && !((*(left - 6) >= 'a' && *(left - 6) <= 'z') || (*(left - 6) >= 'A' && *(left - 6) <= 'Z') || (*(left - 6) >= '0' && *(left - 6) <= '9') || *(left - 6) == '_')) { /* "return" must be a WHOLE WORD, else identifiers like returnPos get split mid-token */
 				if (left[1] == ' ' || left[1] == '\t')
 					left++;
 				found = 1;
@@ -1343,7 +1343,18 @@ void glsl_translator_process(shader *s) {
 	vgl_free(dst2);
 	s->source = final;
 #ifdef DEBUG_GLSL_TRANSLATOR
-	vgl_log("%s:%d %s: GLSL translation output (%s shader):\n\n%s\n\n", __FILE__, __LINE__, __func__, glsl_is_first_shader ? "first" : "second", s->source);
+	vgl_log("%s:%d %s: GLSL translation output (%s shader), LINE-NUMBERED (matches shaccCg 'line N'):\n", __FILE__, __LINE__, __func__, glsl_is_first_shader ? "first" : "second");
+	{
+		const char *_p = s->source;
+		int _ln = 1;
+		while (*_p) {
+			const char *_e = _p;
+			while (*_e && *_e != '\n') _e++;
+			vgl_log("%4d| %.*s\n", _ln++, (int)(_e - _p), _p);
+			_p = (*_e == '\n') ? _e + 1 : _e;
+		}
+		vgl_log("\n");
+	}
 #endif
 
 	vgl_fast_memcpy(&s->semantics, &glsl_bindings_map, sizeof(binds_map));

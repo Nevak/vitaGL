@@ -1006,6 +1006,7 @@ void glUniformBlockBinding(GLuint prog, GLuint uniformBlockIndex, GLuint uniform
 void glUniformMatrix2fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat *value);
 void glUniformMatrix3fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat *value);
 void glUniformMatrix4fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat *value);
+void glUniformMatrix3x4fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat *value);
 GLboolean glUnmapBuffer(GLenum target);
 GLboolean glUnmapNamedBuffer(GLuint buffer);
 void glUseProgram(GLuint program);

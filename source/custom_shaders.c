@@ -613,6 +613,19 @@ void unserialize_shader(void *in, size_t sz, shader *s, GLboolean load_bindings)
 	}
 }
 
+/* Diagnostics: stash the source currently being compiled so shark_log_cb() can print the exact
+ * offending source line that shaccCg names ("... on line N"). Set right before shark_compile. */
+static const char *vgl_dbg_cur_shader_src = NULL;
+static void vgl_dbg_print_shader_line(int line) {
+	if (!vgl_dbg_cur_shader_src || line <= 0) return;
+	const char *p = vgl_dbg_cur_shader_src;
+	int ln = 1;
+	while (*p && ln < line) { if (*p == '\n') ln++; p++; }
+	const char *e = p;
+	while (*e && *e != '\n') e++;
+	vgl_log("Shader Compiler:    >>> line %d: %.*s\n", line, (int)(e - p), p);
+}
+
 #ifdef HAVE_SHADER_CACHE
 #define vgl_compile_shader(shd, sv) compile_shader(shd, sv, fname)
 static inline __attribute__((always_inline)) void compile_shader(shader *s, GLboolean save_bindings, const char *cache_fname) {
@@ -621,6 +634,7 @@ static inline __attribute__((always_inline)) void compile_shader(shader *s, GLbo
 static inline __attribute__((always_inline)) void compile_shader(shader *s, GLboolean save_bindings) {
 #endif
 	// Compiling shader source
+	vgl_dbg_cur_shader_src = (const char *)s->source; // diag: lets shark_log_cb print the offending line
 	s->prog = shark_compile_shader_extended((const char *)s->source, &s->size, s->type == GL_FRAGMENT_SHADER ? SHARK_FRAGMENT_SHADER : SHARK_VERTEX_SHADER, compiler_opts, compiler_fastmath, compiler_fastprecision, compiler_fastint);
 	if (s->prog) {
 		vgl_free(s->source);
@@ -1503,6 +1517,7 @@ void shark_log_cb(const char *msg, shark_log_level msg_level, int line) {
 		sprintf(newline, "%sE] %s on line %d.", is_extra_line ? "\n" : "", msg, line);
 #ifdef LOG_ERRORS
 		vgl_log("Shader Compiler: E] %s on line %d.\n", msg, line);
+		vgl_dbg_print_shader_line(line);
 #endif
 		break;
 	}
@@ -1524,6 +1539,7 @@ void shark_log_cb(const char *msg, shark_log_level msg_level, int line) {
 		break;
 	case SHARK_LOG_ERROR:
 		vgl_log("Shader Compiler: E] %s on line %d.\n", msg, line);
+		vgl_dbg_print_shader_line(line);
 		break;
 	}
 }
@@ -1571,8 +1587,15 @@ void vglSetupRuntimeShaderCompiler(shark_opt opt_level, int32_t use_fastmath, in
 }
 
 GLuint glCreateShader(GLenum shaderType) {
+    vgl_log("glCreateShader called from %p with shaderType %d", __builtin_return_address(0), shaderType);
+
+	vgl_log("glCreateShader: Creating shader of type %x...\n", (shaderType));
+
 #ifndef SKIP_ERROR_HANDLING
 	if (shaderType != GL_FRAGMENT_SHADER && shaderType != GL_VERTEX_SHADER && shaderType != GL_CG_FRAGMENT_SHADER_EXT && shaderType != GL_CG_VERTEX_SHADER_EXT) {
+		// Invalid shader type, exiting call
+		vgl_log("%s:%d %s: Invalid shader type %x.\n", __FILE__, __LINE__, __func__, (shaderType));
+
 		SET_GL_ERROR_WITH_RET_AND_VALUE(GL_INVALID_ENUM, 0, shaderType)
 	}
 #endif
@@ -1614,6 +1637,8 @@ GLuint glCreateShader(GLenum shaderType) {
 	shaders[res - 1].prog = NULL;
 	shaders[res - 1].valid = GL_TRUE;
 	shaders[res - 1].source = NULL;
+
+	vgl_log("glCreateShader: Shader %d created successfully.\n", res);
 
 	return res;
 }
@@ -1743,15 +1768,21 @@ void glShaderBinary(GLsizei count, const GLuint *handles, GLenum binaryFormat, c
 
 void glCompileShader(GLuint handle) {
 	THREAD_SAFE()
-
+	vgl_log("Compiling shader %d...\n", handle);
 	// If vitaShaRK is not enabled, we try to initialize it
 	if (!is_shark_online && !start_shader_compiler()) {
+		vgl_log("%s:%d %s: Failed to start vitaShaRK, shader compilation will not work.\n", __FILE__, __LINE__, __func__);
 		SET_GL_ERROR(GL_INVALID_OPERATION)
 	}
 	
 	// Grabbing passed shader
 	shader *s = &shaders[handle - 1];
-	
+	// Log information about the shader type and whether it is GLSL or not
+ 	vgl_log("s->is_glsl = %d, s->type = %s\n", s->is_glsl, (s->type == GL_VERTEX_SHADER) ? "GL_VERTEX_SHADER" : (s->type == GL_FRAGMENT_SHADER) ? "GL_FRAGMENT_SHADER" : "UNKNOWN");
+#ifdef HAVE_SHADER_CACHE
+ 	vgl_log("Shader source hash: %llX\n", XXH3_64bits(s->source, s->size));
+#endif
+
 	// If we use VGL_MODE_POSTPONED, we compile shaders in glLinkProgram
 	if (s->is_glsl && glsl_sema_mode == VGL_MODE_POSTPONED)
 		return;
@@ -2110,6 +2141,62 @@ void glGetProgramiv(GLuint progr, GLenum pname, GLint *params) {
 	}
 }
 
+// Titan Quest ships GLES3 shaders whose vertex attributes use sparse explicit
+// locations (layout(location=N): position@0, texCoord0@4, vertexColor@14, ...).
+// GLES2 can't express that, so patch_shaders_gles3.py rewrites the qualifier into a
+// /*loc=N*/ marker comment. The engine itself never calls glBindAttribLocation (it
+// relied on the now-stripped layout), so without this vitaGL would densify the
+// locations to 0,1,2,... and e.g. texCoord0 would read an empty/zero stream. Recover
+// the markers here and feed them through the normal glBindAttribLocation deferred
+// path (replayed a few lines below), which builds the correct sparse attr_map.
+static inline GLboolean is_ident_char(char c) {
+	return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_';
+}
+static void glsl_recover_attr_locations(program *p) {
+	if (!p->vshader || !p->vshader->is_glsl || !p->vshader->source)
+		return;
+	if (p->glsl_attr_map) // engine supplied bindings explicitly; don't second-guess it
+		return;
+	char *s = p->vshader->source;
+	char *m;
+	uint32_t seen_locs = 0; // some shaders alias two names onto one location; first wins
+	while ((m = strstr(s, "/*loc=")) != NULL) {
+		s = m + 6;
+		int loc = 0;
+		GLboolean got = GL_FALSE;
+		while (*s >= '0' && *s <= '9') { loc = loc * 10 + (*s - '0'); s++; got = GL_TRUE; }
+		if (!got) continue;
+		if (loc < VERTEX_ATTRIBS_NUM && (seen_locs & (1u << loc))) {
+			s = strstr(s, ";") ? strstr(s, ";") + 1 : s; continue;
+		}
+		char *semi = strstr(s, ";");
+		if (!semi) break;
+		char *e = semi - 1;
+		while (e > s && (*e == ' ' || *e == '\t' || *e == '\r' || *e == '\n')) e--;
+		if (*e == ']') { // array attribute: skip [..] back to the variable name
+			while (e > s && *e != '[') e--;
+			if (e > s) e--;
+			while (e > s && (*e == ' ' || *e == '\t' || *e == '\r' || *e == '\n')) e--;
+		}
+		char *ne = e;
+		while (e > s && is_ident_char(*e)) e--;
+		char *ns = is_ident_char(*e) ? e : e + 1;
+		int len = (int)(ne - ns + 1);
+		if (len <= 0 || len >= 64) { s = semi + 1; continue; }
+		if (p->num_glsl_attr >= VERTEX_ATTRIBS_NUM) break;
+		if (!p->glsl_attr_map)
+			p->glsl_attr_map = vglMalloc(sizeof(attr_mapping) * VERTEX_ATTRIBS_NUM);
+		p->glsl_attr_map[p->num_glsl_attr].idx = (GLuint)loc;
+		vgl_fast_memcpy(p->glsl_attr_map[p->num_glsl_attr].name, ns, len);
+		p->glsl_attr_map[p->num_glsl_attr].name[len] = 0;
+		vgl_log("[ATTRLOC] recovered loc=%d name=%s\n", loc, p->glsl_attr_map[p->num_glsl_attr].name);
+		p->num_glsl_attr++;
+		if (loc < VERTEX_ATTRIBS_NUM)
+			seen_locs |= (1u << loc);
+		s = semi + 1;
+	}
+}
+
 void glLinkProgram(GLuint progr) {
 	THREAD_SAFE()
 
@@ -2132,6 +2219,15 @@ void glLinkProgram(GLuint progr) {
 	// With VGL_MODE_POSTPONED we perform shaders translation+compilation and attributes binding prior actual program linking
 	if (glsl_sema_mode == VGL_MODE_POSTPONED && (p->vshader->is_glsl || p->fshader->is_glsl)) {
 		glsl_sema_mode = VGL_MODE_SHADER_PAIR;
+
+		// Recover sparse layout(location=N) bindings preserved as /*loc=N*/ markers in the
+		// vertex shader (TQ's engine never calls glBindAttribLocation). MUST run here, BEFORE
+		// glsl_translator_set_process(): the GLSL preprocessor strips C-comments and replaces
+		// p->vshader->source, so the markers only exist in the original source at this point.
+		// This only fills p->glsl_attr_map (name+idx); the actual bind is replayed below once
+		// the gxp is compiled and the default attr bindings are set.
+		glsl_recover_attr_locations(p);
+
 #ifdef HAVE_SHADER_CACHE
 		char frag_fname[256], vert_fname[256];
 		char *fname;
@@ -2183,6 +2279,8 @@ void glLinkProgram(GLuint progr) {
 		// Setting progressive default attribute bindings
 		set_default_attrib_binding();
 
+		// Replay the recovered sparse locations (collected above, before translation) through
+		// the real glBindAttribLocation so e.g. texCoord0 maps to GL location 4, not 1.
 		if (p->glsl_attr_map) {
 			for (int i = 0; i < p->num_glsl_attr; i++) {
 				glBindAttribLocation(progr, p->glsl_attr_map[i].idx, p->glsl_attr_map[i].name);
@@ -2409,6 +2507,13 @@ void glLinkProgram(GLuint progr) {
 				}
 			}
 		}
+
+		// [ATTRMAP] confirm the attribute->VAO-slot routing. Before the loc fix this is
+		// dense (map[k]=k, unaligned=0); after, sparse (e.g. map={0,1,4} with unaligned=1).
+		vgl_log("[ATTRMAP] prog=%u attr_num=%u unaligned=%d highest=%u | ", progr, p->attr_num, p->has_unaligned_attrs, p->attr_highest_idx);
+		for (uint32_t k = 0; k < p->attr_num; k++)
+			vgl_log("map[%u]=%u(reg=%u) ", k, p->attr_map[k], p->attr[p->attr_map[k]].regIndex);
+		vgl_log("\n");
 	}
 }
 
@@ -2930,6 +3035,33 @@ inline void glUniformMatrix4fv(GLint location, GLsizei count, GLboolean transpos
 
 void glProgramUniformMatrix4fv(GLuint prog, GLint location, GLsizei count, GLboolean transpose, const GLfloat *value) {
 	glUniformMatrix4fv(location, count, transpose, value);
+}
+
+inline void glUniformMatrix3x4fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat *value) {
+	THREAD_SAFE()
+
+	// Checking if the uniform does exist
+	if (location == -1 || location == 0)
+		return;
+
+	// Grabbing passed uniform
+	int offs = 0;
+	uniform *u = (uniform *)get_uniform_from_ptr(location, &offs);
+
+	// GLSL mat3x4 (3 columns x 4 rows) is translated to Cg float3x4 (3 rows x vec4), i.e. 3 vec4
+	// registers per matrix (used for skinning bone palettes). With the GL default transpose=GL_FALSE
+	// the engine's column-major data already lands as the Cg rows, so upload it directly:
+	// 3*count rows of 4 floats each. (Without this, skinning matrices were never uploaded -> skinned
+	// meshes collapsed to the origin and vanished.)
+	if (transpose) {
+		static GLboolean warned = GL_FALSE;
+		if (!warned) { warned = GL_TRUE; vgl_log("%s:%d: %s: transpose=GL_TRUE unsupported for mat3x4, uploading as-is\n", __FILE__, __LINE__, __func__); }
+	}
+	vgl_fill_uniform_data(value, SCE_GXM_PARAMETER_TYPE_F32, 4, 3 * count)
+}
+
+void glProgramUniformMatrix3x4fv(GLuint prog, GLint location, GLsizei count, GLboolean transpose, const GLfloat *value) {
+	glUniformMatrix3x4fv(location, count, transpose, value);
 }
 
 void glEnableVertexAttribArray(GLuint index) {
